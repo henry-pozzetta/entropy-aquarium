@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Entropy Aquarium — Client-only Kiosk</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  html, body { margin:0; height:100%; overflow:hidden; background:#0b0d12; color:#e8edf3; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  canvas { display:block; }
+  #ui { position:fixed; top:12px; right:12px; display:flex; gap:8px; align-items:center; background:rgba(15,18,26,0.6); padding:8px 10px; border-radius:12px; backdrop-filter: blur(6px); border:1px solid rgba(255,255,255,0.08);}
+  #status { font-size:12px; opacity:0.85 }
+  #source, #reset { appearance:none; background:#121622; color:#e8edf3; border:1px solid rgba(255,255,255,0.08); border-radius:10px; padding:6px 10px; font-size:14px; }
+  #reset { cursor:pointer }
+  #stats { position:fixed; bottom:12px; right:12px; width:300px; background:rgba(15,18,26,0.6); padding:10px 12px; border-radius:12px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; border:1px solid rgba(255,255,255,0.08); }
+  #stats h3 { margin:0 0 6px 0; font-size:12px; letter-spacing: .08em; text-transform: uppercase; color:#a5b4c7; }
+  #stats .row { display:flex; justify-content:space-between; font-size:12px; margin:2px 0; }
+  #badge { padding:2px 8px; border-radius:999px; font-size:12px; margin-left:6px; }
+  .ok { background:#16351a; color:#76e38f; border:1px solid #294b2e; }
+  .warn { background:#402b12; color:#ffb46b; border:1px solid #5c3b18; }
+  .err { background:#4a1f27; color:#ff8fa3; border:1px solid #61323a; }
+  #notice { position:fixed; left:50%; transform:translateX(-50%); top:12px; background:rgba(30,33,43,0.85); border:1px solid rgba(255,255,255,0.1); color:#dbe6ff; padding:6px 10px; border-radius:10px; display:none; }
+  a { color:#8dc8ff; text-decoration: none; border-bottom: 1px dotted #8dc8ff33; }
+  #footer { position:fixed; left:12px; bottom:12px; font-size:12px; opacity:.7; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <label for="source" style="font-size:13px;opacity:.85">Input Source</label>
+  <select id="source">
+    <option value="synthetic">Synthetic (built-in)</option>
+    <option value="wikipedia_rc">Wikipedia Recent Changes (SSE)</option>
+    <option value="bitstamp_btcusd">Bitstamp BTCUSD (WS)</option>
+    <option value="btc_binance">BTC (Binance WS)</option>
+    <option value="btc_coingecko">BTC (Coingecko HTTP)</option>
+    <option value="user_input">User Interaction</option>
+  </select>
+  <button id="reset" title="Reset camera view">Reset View</button>
+  <div id="status">
+    <span>Stream:</span>
+    <span id="badge" class="warn">idle</span>
+  </div>
+</div>
+
+<div id="stats">
+  <h3>Stats for Nerds</h3>
+  <div class="row"><span>Source</span><span id="s_source">synthetic</span></div>
+  <div class="row"><span>Rate (Hz)</span><span id="s_rate">—</span></div>
+  <div class="row"><span>Bins / Window</span><span id="s_bw">32 / 128</span></div>
+  <div class="row"><span>H~</span><span id="s_h">—</span></div>
+  <div class="row"><span>dH/dt</span><span id="s_dh">—</span></div>
+  <div class="row"><span>d²H/dt²</span><span id="s_ddh">—</span></div>
+  <div class="row"><span>Magnitude</span><span id="s_mag">—</span></div>
+  <div class="row"><span>Heading</span><span id="s_head">—</span></div>
+  <div class="row"><span>Strategy</span><span id="s_strat">simple-reverse</span></div>
+  <div class="row"><span>Offset</span><span id="s_off">—</span></div>
+</div>
+
+<div id="notice"></div>
+<div id="footer">Entropy Aquarium (client-only) · <a href="https://entropyengine.dev" target="_blank">entropyengine.dev</a></div>
+
+<canvas id="c"></canvas>
+
+<!-- Import map resolves 'three' for ES modules -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+
+/* --------------------- Query params & DOM --------------------- */
+function qp(name, d=null){ const u=new URL(location.href); return u.searchParams.get(name) ?? d; }
+
+const MAG_LEN_SCALE = 5.0;
+const TRAIL_POINTS  = 240;
+const BG_BASE       = 0x0b0d12;
+const TARGET_HZ     = Math.max(1, Number(qp('hz', '15'))); // uniform engine/UI rate
+
+const canvas   = document.getElementById('c');
+const badge    = document.getElementById('badge');
+const sourceSel= document.getElementById('source');
+const resetBtn = document.getElementById('reset');
+const noticeEl = document.getElementById('notice');
+
+const s_source = document.getElementById('s_source');
+const s_rate   = document.getElementById('s_rate');
+const s_bw     = document.getElementById('s_bw');
+const s_h      = document.getElementById('s_h');
+const s_dh     = document.getElementById('s_dh');
+const s_ddh    = document.getElementById('s_ddh');
+const s_mag    = document.getElementById('s_mag');
+const s_head   = document.getElementById('s_head');
+const s_strat  = document.getElementById('s_strat');
+const s_off    = document.getElementById('s_off');
+
+function setBadge(state, text) {
+  badge.textContent = text;
+  badge.className = ''; badge.id = 'badge';
+  if (state === 'ok')   badge.classList.add('ok');
+  if (state === 'warn') badge.classList.add('warn');
+  if (state === 'err')  badge.classList.add('err');
+}
+function flashNotice(msg) {
+  noticeEl.textContent = msg;
+  noticeEl.style.display = 'block';
+  clearTimeout(flashNotice._t);
+  flashNotice._t = setTimeout(() => { noticeEl.style.display = 'none'; }, 1800);
+}
+
+/* --------------------- Three.js scene --------------------- */
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, 2, 0.1, 1000);
+const controls = new OrbitControls(camera, renderer.domElement);
+
+camera.position.set(8, 6, 10);
+controls.target.set(0, 0, 0);
+controls.enableDamping = true;
+controls.update();
+controls.saveState();
+
+scene.add(new THREE.HemisphereLight(0x8db3ff, 0x1b2030, 0.8));
+const dir = new THREE.DirectionalLight(0xffffff, 0.8); dir.position.set(5,8,4); scene.add(dir);
+
+const axes = new THREE.AxesHelper(6);
+axes.material.depthTest = false; axes.material.transparent = true; axes.material.opacity = 0.25;
+scene.add(axes);
+
+const arrow = new THREE.ArrowHelper(new THREE.Vector3(1,0,0).normalize(), new THREE.Vector3(0,0,0), 3, 0x66d1ff, 0.6, 0.35);
+scene.add(arrow);
+const ghost = new THREE.ArrowHelper(new THREE.Vector3(-1,0,0).normalize(), new THREE.Vector3(0,0,0), 3, 0x66ffc2, 0.55, 0.3);
+ghost.cone.material.transparent = ghost.line.material.transparent = true;
+ghost.cone.material.opacity = ghost.line.material.opacity = 0.45;
+scene.add(ghost);
+
+const trailGeom = new THREE.BufferGeometry();
+const trailPositions = new Float32Array(TRAIL_POINTS * 3);
+trailGeom.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3));
+const trailMat = new THREE.LineBasicMaterial({ color: 0x93a9ff, transparent: true, opacity: 0.55 });
+const trail = new THREE.Line(trailGeom, trailMat);
+scene.add(trail);
+
+const grid = new THREE.GridHelper(40, 40, 0x2a2f45, 0x1a1f35);
+grid.material.transparent = true; grid.material.opacity = 0.15;
+scene.add(grid);
+
+function colorFromMagnitude(mag) {
+  const t = Math.max(0, Math.min(1, mag / 1.5));
+  const cold = new THREE.Color(0x66d1ff);
+  const warm = new THREE.Color(0xff7b4a);
+  return cold.clone().lerp(warm, t).getHex();
+}
+function updateTrail(tip) {
+  for (let i = 0; i < TRAIL_POINTS - 1; i++) {
+    trailPositions[i*3+0] = trailPositions[(i+1)*3+0];
+    trailPositions[i*3+1] = trailPositions[(i+1)*3+1];
+    trailPositions[i*3+2] = trailPositions[(i+1)*3+2];
+  }
+  trailPositions[(TRAIL_POINTS-1)*3+0] = tip.x;
+  trailPositions[(TRAIL_POINTS-1)*3+1] = tip.y;
+  trailPositions[(TRAIL_POINTS-1)*3+2] = tip.z;
+  trailGeom.attributes.position.needsUpdate = true;
+}
+function clearTrail(){ trailPositions.fill(0); trailGeom.attributes.position.needsUpdate = true; }
+function setBackgroundByH(H) {
+  const base = new THREE.Color(BG_BASE), tint = new THREE.Color(0x16223a);
+  renderer.setClearColor(base.clone().lerp(tint, Math.max(0, Math.min(1, H))).getHex(), 1);
+}
+resetBtn.addEventListener('click', () => { controls.reset(); clearTrail(); });
+
+function resizeRendererToDisplaySize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  if (canvas.width !== w || canvas.height !== h) {
+    renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix();
+  }
+}
+window.addEventListener('resize', resizeRendererToDisplaySize);
+function render(){ resizeRendererToDisplaySize(); controls.update(); renderer.render(scene, camera); requestAnimationFrame(render); }
+render();
+
+/* --------------------- Entropy Engine (client) --------------------- */
+class EntropyEngine {
+  constructor({windowSize=128, bins=32}={}) {
+    this.window = windowSize; this.bins = bins;
+    this.buf = []; this.times = [];
+    this.prevH = null; this.prev_dH = null;
+  }
+  step(rawValue, t=performance.now()) {
+    this.buf.push(rawValue); this.times.push(t);
+    if (this.buf.length > this.window) { this.buf.shift(); this.times.shift(); }
+    if (this.buf.length < Math.max(8, this.window/4)) return null;
+
+    const min = Math.min(...this.buf), max = Math.max(...this.buf);
+    const rng = (max - min) || 1;
+    const norm = this.buf.map(v => (v - min) / rng);
+
+    const bins = this.bins;
+    const hist = new Array(bins).fill(0);
+    for (const v of norm) { let bi = Math.floor(v * bins); if (bi === bins) bi = bins - 1; hist[bi]++; }
+    const total = hist.reduce((a,b)=>a+b,0) || 1;
+    const probs = hist.map(c => c/total).filter(p => p>0);
+    const H = -probs.reduce((s,p)=>s + p*Math.log2(p), 0);
+    const Hmax = Math.log2(bins); const Hnorm = Hmax ? (H / Hmax) : 0;
+
+    const n = this.times.length;
+    const dt = (n >= 2) ? Math.max(1e-6, (this.times[n-1] - this.times[n-2]) / 1000) : 1;
+
+    let dH = 0, ddH = 0;
+    if (this.prevH !== null) {
+      dH = (Hnorm - this.prevH) / dt;
+      if (this.prev_dH !== null) ddH = (dH - this.prev_dH) / dt;
+    }
+    this.prev_dH = dH; this.prevH = Hnorm;
+    return { H: Hnorm, dH, ddH, dt };
+  }
+}
+
+/* --------------------- Rate Adapter (uniform Hz) --------------------- */
+class RateAdapter {
+  constructor(targetHz, onTick, mode='mean') {
+    this.dt = 1000 / Math.max(1, targetHz);
+    this.onTick = onTick;
+    this.mode = mode;
+    this.buf = [];
+    this.hold = 0.5;
+    this.timer = null;
+    this.hz = 0; this._cnt = 0; this._last = performance.now();
+  }
+  push(v){ this.buf.push(v); this.hold = v; }
+  start(){
+    this.stop();
+    this.timer = setInterval(() => {
+      // Compute representative value since last tick
+      let x = this.hold;
+      if (this.buf.length) {
+        if (this.mode === 'last') x = this.buf[this.buf.length - 1];
+        else { // mean
+          let s = 0; for (const v of this.buf) s += v; x = s / this.buf.length;
+        }
+      }
+      this.buf.length = 0;
+
+      // Update local Hz estimator
+      const now = performance.now(); this._cnt++;
+      if (now - this._last >= 1000) { this.hz = this._cnt; this._cnt = 0; this._last = now; }
+
+      this.onTick(x, this.hz);
+    }, this.dt);
+  }
+  stop(){ if (this.timer) clearInterval(this.timer); this.timer = null; this.buf.length = 0; }
+}
+
+/* --------------------- Client-only Streams --------------------- */
+const Stream = (() => {
+  function synthetic(onValue, {dt=100}={}) {
+    let t=0, phase=Math.random(), h;
+    const tick=()=> {
+      const val = (0.5 + 0.45*Math.sin(2*Math.PI*((t/1000)/5 + phase)) + (Math.random()*0.1-0.05));
+      const spk = (Math.random() < 0.02) ? Math.random() : 0;
+      onValue(Math.max(0, Math.min(1, spk || val)));
+      t += dt; h = setTimeout(tick, dt);
+    };
+    tick();
+    return () => clearTimeout(h);
+  }
+
+  function btc_binance(onValue) {
+    const url = 'wss://stream.binance.com:9443/ws/btcusdt@trade';
+    let ws, priceBuf=[];
+    function open() {
+      ws = new WebSocket(url);
+      ws.onopen = () => setBadge('ok','btc_binance');
+      ws.onmessage = ev => {
+        try {
+          const data = JSON.parse(ev.data);
+          const p = parseFloat(data.p); if (!isFinite(p)) return;
+          priceBuf.push(p); if (priceBuf.length > 256) priceBuf.shift();
+          const min = Math.min(...priceBuf), max = Math.max(...priceBuf);
+          const v = (max>min) ? (p - min) / (max-min) : 0.5;
+          onValue(Math.max(0, Math.min(1, v)));
+        } catch {}
+      };
+      ws.onerror = () => setBadge('err','ws error');
+      ws.onclose = () => { setBadge('warn','reconnecting…'); setTimeout(open, 1200); };
+    }
+    open();
+    return () => { try { ws && ws.close(); } catch {} };
+  }
+
+  function btc_coingecko(onValue, {interval=5000}={}) {
+    let timer, priceBuf=[], failures=0;
+    const url = 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd';
+    async function poll() {
+      try {
+        const res = await fetch(url, { cache: 'no-store' });
+        if (!res.ok) throw new Error('HTTP '+res.status);
+        const json = await res.json();
+        const p = Number(json?.bitcoin?.usd);
+        if (!isFinite(p)) throw new Error('no price');
+        priceBuf.push(p); if (priceBuf.length > 256) priceBuf.shift();
+        const min = Math.min(...priceBuf), max = Math.max(...priceBuf);
+        const v = (max>min) ? (p - min) / (max-min) : 0.5;
+        onValue(Math.max(0, Math.min(1, v)));
+        setBadge('ok','btc_coingecko');
+        failures = 0;
+      } catch (e) {
+        failures++;
+        setBadge('err', 'http error');
+        if (failures === 3) flashNotice('Coingecko blocked or offline — staying on last value');
+      } finally {
+        timer = setTimeout(poll, interval);
+      }
+    }
+    poll();
+    return () => { clearTimeout(timer); };
+  }
+
+  // NEW: Wikipedia Recent Changes (SSE) — frequent public stream
+  function wikipedia_rc(onValue) {
+    const url = 'https://stream.wikimedia.org/v2/stream/recentchange';
+    let es;
+    try {
+      es = new EventSource(url);
+    } catch (e) {
+      setBadge('err', 'SSE unsupported'); return () => {};
+    }
+    let fail = 0;
+    es.onopen = () => setBadge('ok','wikipedia_rc');
+    es.onerror = () => { setBadge('warn','sse error'); if (++fail===3) flashNotice('SSE errors (network?)'); };
+    es.onmessage = ev => {
+      try {
+        const data = JSON.parse(ev.data);
+        // Use size delta when available; else fallback to a hashed jitter
+        const delta = Math.abs((data.length?.new ?? 0) - (data.length?.old ?? 0));
+        // Smoothly squash to [0,1]
+        const v = Math.max(0, Math.min(1, Math.tanh(delta/200)));
+        onValue(v);
+      } catch {}
+    };
+    return () => es.close();
+  }
+
+  // NEW: Bitstamp BTCUSD trades (WebSocket)
+  function bitstamp_btcusd(onValue) {
+    const url = 'wss://ws.bitstamp.net';
+    let ws;
+    function open(){
+      ws = new WebSocket(url);
+      ws.onopen = () => {
+        setBadge('ok', 'bitstamp');
+        ws.send(JSON.stringify({ event: 'bts:subscribe', data: { channel: 'live_trades_btcusd' }}));
+      };
+      ws.onmessage = ev => {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.event === 'trade' && msg.data) {
+            const p = parseFloat(msg.data.price); if (!isFinite(p)) return;
+            // map with rolling min-max (maintained implicitly by RateAdapter via engine window)
+            onValue(p); // let RateAdapter/Engine normalize/aggregate
+          }
+        } catch {}
+      };
+      ws.onerror = () => setBadge('err', 'ws error');
+      ws.onclose = () => { setBadge('warn', 'reconnecting…'); setTimeout(open, 1200); };
+    }
+    open();
+    return () => { try { ws && ws.close(); } catch {} };
+  }
+
+  function user_input(onValue) {
+    let lastX=null, lastY=null, speed=0, rafId=null;
+    const MAX_SPEED = 60, alpha = 0.2, decay = 0.9;
+    function onMove(ev) {
+      let x, y;
+      if (ev.touches && ev.touches.length) { x = ev.touches[0].clientX; y = ev.touches[0].clientY; }
+      else { x = ev.clientX; y = ev.clientY; }
+      if (lastX != null) {
+        const dx = x - lastX, dy = y - lastY;
+        const dist = Math.hypot(dx, dy);
+        speed = alpha*dist + (1-alpha)*speed;
+      }
+      lastX = x; lastY = y;
+    }
+    function loop() {
+      speed *= decay;
+      const v = Math.max(0, Math.min(1, speed / MAX_SPEED));
+      onValue(v);
+      rafId = requestAnimationFrame(loop);
+    }
+    window.addEventListener('mousemove', onMove, { passive:true });
+    window.addEventListener('touchmove', onMove, { passive:true });
+    rafId = requestAnimationFrame(loop);
+    setBadge('ok','user_input');
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('touchmove', onMove);
+      cancelAnimationFrame(rafId);
+    };
+  }
+
+  return { synthetic, btc_binance, btc_coingecko, wikipedia_rc, bitstamp_btcusd, user_input };
+})();
+
+/* --------------------- Orchestrator with RateAdapter --------------------- */
+const engine = new EntropyEngine({windowSize:128, bins:32});
+let stopStream = null;
+let rate = null;
+
+function pipeline(val, hzEstimate=TARGET_HZ) {
+  const now = performance.now();
+  const out = engine.step(val, now);
+  // update Hz display from adapter estimate
+  s_rate.textContent = String(hzEstimate);
+
+  if (!out) return;
+  const {H, dH, ddH} = out;
+  const mag = Math.hypot(H, dH, ddH);
+  const az  = (Math.atan2(dH, H) * 180/Math.PI) || 0;
+  const el  = (Math.atan2(ddH, Math.hypot(H, dH)) * 180/Math.PI) || 0;
+  const opp = [-H, -dH, -ddH];
+  const denom = (mag*mag) || 1;
+  let offset=0; try { const cosang = Math.max(-1, Math.min(1, (H*opp[0]+dH*opp[1]+ddH*opp[2]) / denom)); offset = Math.acos(cosang)*180/Math.PI; } catch { offset=0; }
+
+  s_h.textContent     = H.toFixed(3);
+  s_dh.textContent    = (dH>=0?'+':'')+dH.toFixed(3);
+  s_ddh.textContent   = (ddH>=0?'+':'')+ddH.toFixed(3);
+  s_mag.textContent   = mag.toFixed(3);
+  s_head.textContent  = `${az.toFixed(1)}°, ${el.toFixed(1)}°`;
+  s_off.textContent   = `${offset.toFixed(1)}°`;
+
+  const dirVec = new THREE.Vector3(H, dH, ddH);
+  if (dirVec.lengthSq() < 1e-8) dirVec.set(1e-4, 0, 0);
+  const direction = dirVec.clone().normalize();
+  const length = Math.max(0.5, MAG_LEN_SCALE * Math.min(mag, 2.0));
+
+  arrow.setDirection(direction);
+  arrow.setLength(length, 0.6, 0.35);
+  arrow.setColor(new THREE.Color(colorFromMagnitude(mag)));
+
+  const oppDir = new THREE.Vector3(opp[0], opp[1], opp[2]).normalize();
+  ghost.setDirection(oppDir);
+  ghost.setLength(Math.max(0.5, length * 0.9));
+
+  const tip = direction.clone().multiplyScalar(length);
+  updateTrail(tip);
+  setBackgroundByH(H);
+}
+
+function startSource(name) {
+  if (stopStream) { stopStream(); stopStream = null; }
+  if (rate) { rate.stop(); rate = null; }
+  s_source.textContent = name; setBadge('warn','starting…');
+
+  // one RateAdapter per source, uniform target
+  rate = new RateAdapter(TARGET_HZ, (val, hz) => pipeline(val, hz), 'mean');
+  rate.start();
+
+  // stream pushes samples at whatever speed; RateAdapter handles uniform ticks
+  try {
+    stopStream =
+        name === 'wikipedia_rc'  ? Stream.wikipedia_rc(v => rate.push(v))
+      : name === 'bitstamp_btcusd'? Stream.bitstamp_btcusd(v => rate.push(v))
+      : name === 'btc_binance'    ? Stream.btc_binance(v => rate.push(v))
+      : name === 'btc_coingecko'  ? Stream.btc_coingecko(v => rate.push(v))
+      : name === 'user_input'     ? Stream.user_input(v => rate.push(v))
+      :                             Stream.synthetic(v => rate.push(v));
+    setBadge('ok', name);
+  } catch (e) {
+    console.error(e);
+    flashNotice('stream failed, falling back to synthetic');
+    stopStream = Stream.synthetic(v => rate.push(v));
+    setBadge('ok', 'synthetic');
+  }
+}
+
+sourceSel.addEventListener('change', () => startSource(sourceSel.value));
+startSource(qp('src','synthetic'));
+</script>
+</body>
+</html>
